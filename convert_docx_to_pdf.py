@@ -1,8 +1,12 @@
 """
-DOCX-to-PDF Converter — GUI Edition
+DOCX-to-PDF Converter — GUI + CLI
 
-Browse to a folder (including mapped Google Drive letters), convert every
-.docx file to PDF, and view a live progress bar plus a detailed report table.
+Converts every .docx file in a directory (and subdirectories) to PDF.
+
+When a graphical display is available the app opens a tkinter GUI with a
+directory browser, progress bar, and report table.  On headless servers
+(no $DISPLAY) it falls back automatically to an interactive CLI mode.
+You can also force CLI mode with the --cli flag.
 
 Requirements:
     - Python 3.8+  (tkinter is included with the standard installer)
@@ -16,12 +20,10 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 
 
 # ---------------------------------------------------------------------------
-# Conversion logic (runs on a background thread)
+# Conversion logic
 # ---------------------------------------------------------------------------
 
 def find_docx_files(root: Path):
@@ -65,217 +67,328 @@ def convert_one_libreoffice(docx_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Main application window
+# Display detection
 # ---------------------------------------------------------------------------
 
-class ConverterApp(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("DOCX to PDF Converter")
-        self.minsize(780, 520)
-        self._build_ui()
-        self._converting = False
+def _display_available():
+    """Return True if a graphical display is available for tkinter."""
+    if sys.platform == "win32":
+        return True  # Windows always has a desktop when logged in
+    if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+        return False
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.destroy()
+        return True
+    except Exception:
+        return False
 
-    # ---- UI construction ---------------------------------------------------
 
-    def _build_ui(self):
-        pad = {"padx": 10, "pady": 5}
+# ---------------------------------------------------------------------------
+# CLI mode (headless)
+# ---------------------------------------------------------------------------
 
-        # -- Directory row ---------------------------------------------------
-        dir_frame = ttk.Frame(self)
-        dir_frame.pack(fill="x", **pad)
+def main_cli():
+    """Interactive CLI mode for headless environments."""
+    print("DOCX to PDF Converter (CLI mode)\n")
 
-        ttk.Label(dir_frame, text="Directory:").pack(side="left")
-        self.dir_var = tk.StringVar()
-        self.dir_entry = ttk.Entry(dir_frame, textvariable=self.dir_var)
-        self.dir_entry.pack(side="left", fill="x", expand=True, padx=(5, 5))
-        ttk.Button(dir_frame, text="Browse", command=self._browse).pack(side="left")
+    directory = input("Enter the directory path containing .docx files: ").strip()
+    directory = directory.strip('"').strip("'")
 
-        # -- Convert button --------------------------------------------------
-        self.convert_btn = ttk.Button(self, text="Convert", command=self._start_conversion)
-        self.convert_btn.pack(**pad)
+    root = Path(directory)
+    if not root.is_dir():
+        print(f"Error: '{directory}' is not a valid directory.")
+        sys.exit(1)
 
-        # -- Progress bar + counter ------------------------------------------
-        prog_frame = ttk.Frame(self)
-        prog_frame.pack(fill="x", **pad)
+    docx_files = find_docx_files(root)
+    if not docx_files:
+        print("No .docx files found.")
+        sys.exit(0)
 
-        ttk.Label(prog_frame, text="Progress:").pack(side="left")
-        self.progress = ttk.Progressbar(prog_frame, length=400, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=(5, 5))
-        self.prog_label = ttk.Label(prog_frame, text="0 / 0")
-        self.prog_label.pack(side="left")
+    total = len(docx_files)
+    print(f"Found {total} .docx file(s).\n")
 
-        # -- Report table (Treeview) -----------------------------------------
-        table_frame = ttk.LabelFrame(self, text="Conversion Report")
-        table_frame.pack(fill="both", expand=True, **pad)
+    use_word = sys.platform == "win32"
 
-        columns = ("num", "file", "status", "pdf_path")
-        self.tree = ttk.Treeview(
-            table_frame, columns=columns, show="headings", selectmode="browse"
-        )
-        self.tree.heading("num", text="#")
-        self.tree.heading("file", text="File")
-        self.tree.heading("status", text="Status")
-        self.tree.heading("pdf_path", text="PDF Path")
-
-        self.tree.column("num", width=40, stretch=False, anchor="center")
-        self.tree.column("file", width=220, anchor="w")
-        self.tree.column("status", width=140, anchor="w")
-        self.tree.column("pdf_path", width=340, anchor="w")
-
-        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-        self.tree.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-        # -- Summary label ---------------------------------------------------
-        self.summary_var = tk.StringVar(value="Total: 0 | Converted: 0 | Skipped: 0 | Failed: 0")
-        ttk.Label(self, textvariable=self.summary_var, font=("", 10, "bold")).pack(**pad)
-
-    # ---- Callbacks ---------------------------------------------------------
-
-    def _browse(self):
-        folder = filedialog.askdirectory(title="Select folder with .docx files")
-        if folder:
-            self.dir_var.set(folder)
-
-    def _start_conversion(self):
-        if self._converting:
-            return
-
-        directory = self.dir_var.get().strip().strip('"').strip("'")
-        if not directory:
-            messagebox.showwarning("No directory", "Please select a directory first.")
-            return
-
-        root = Path(directory)
-        if not root.is_dir():
-            messagebox.showerror("Invalid directory", f"'{directory}' is not a valid directory.")
-            return
-
-        docx_files = find_docx_files(root)
-        if not docx_files:
-            messagebox.showinfo("Nothing to do", "No .docx files found in that directory.")
-            return
-
-        # Reset UI
-        self.tree.delete(*self.tree.get_children())
-        total = len(docx_files)
-        self.progress["maximum"] = total
-        self.progress["value"] = 0
-        self.prog_label.config(text=f"0 / {total}")
-        self.summary_var.set(f"Total: {total} | Converted: 0 | Skipped: 0 | Failed: 0")
-        self.convert_btn.state(["disabled"])
-        self._converting = True
-
-        # Launch background thread
-        thread = threading.Thread(
-            target=self._convert_thread, args=(root, docx_files), daemon=True
-        )
-        thread.start()
-
-    # ---- Background conversion thread --------------------------------------
-
-    def _convert_thread(self, root: Path, docx_files: list):
-        use_word = sys.platform == "win32"
-
-        # --- Platform-specific setup ----------------------------------------
-        word = None
-        if use_word:
+    # --- Platform-specific setup --------------------------------------------
+    word = None
+    if use_word:
+        try:
             import comtypes
             import comtypes.client
-            comtypes.CoInitialize()
-            try:
-                word = comtypes.client.CreateObject("Word.Application")
-                word.Visible = False
-            except Exception as exc:
-                comtypes.CoUninitialize()
-                self.after(0, self._thread_error, f"Could not start Word:\n{exc}")
-                return
-        else:
-            if shutil.which("soffice") is None:
-                self.after(
-                    0, self._thread_error,
-                    "LibreOffice is not installed.\n\n"
-                    "Install it with:  sudo apt install libreoffice",
-                )
-                return
-
-        # --- Convert each file ----------------------------------------------
-        total = len(docx_files)
-        converted = 0
-        skipped = 0
-        failed = 0
-
+        except ImportError:
+            print("Missing dependency. Install it with:  pip install comtypes")
+            sys.exit(1)
+        comtypes.CoInitialize()
         try:
-            for idx, docx_file in enumerate(docx_files, start=1):
-                abs_path = docx_file.resolve()
-                pdf_path = abs_path.with_suffix(".pdf")
+            word = comtypes.client.CreateObject("Word.Application")
+            word.Visible = False
+        except Exception as exc:
+            comtypes.CoUninitialize()
+            print(f"Error: Could not start Word: {exc}")
+            sys.exit(1)
+    else:
+        if shutil.which("soffice") is None:
+            print("Error: LibreOffice is not installed.")
+            print("Install it with:  sudo apt install libreoffice")
+            sys.exit(1)
 
-                # Skip if a PDF already exists
-                if pdf_path.exists():
-                    skipped += 1
-                    status = "Skipped — PDF exists"
-                    pdf_display = str(pdf_path)
+    # --- Convert each file --------------------------------------------------
+    converted = 0
+    skipped = 0
+    failed = 0
+
+    try:
+        for idx, docx_file in enumerate(docx_files, start=1):
+            abs_path = docx_file.resolve()
+            pdf_path = abs_path.with_suffix(".pdf")
+
+            try:
+                rel = docx_file.relative_to(root)
+            except ValueError:
+                rel = docx_file
+
+            if pdf_path.exists():
+                skipped += 1
+                print(f"  [{idx}/{total}] {rel} ... Skipped (PDF exists)")
+            else:
+                if use_word:
+                    pdf_path, error = convert_one_word(abs_path, word)
                 else:
-                    if use_word:
-                        pdf_path, error = convert_one_word(abs_path, word)
-                    else:
-                        pdf_path, error = convert_one_libreoffice(abs_path)
+                    pdf_path, error = convert_one_libreoffice(abs_path)
 
-                    if error is None:
-                        converted += 1
-                        status = "Success"
+                if error is None:
+                    converted += 1
+                    print(f"  [{idx}/{total}] {rel} ... Success")
+                else:
+                    failed += 1
+                    print(f"  [{idx}/{total}] {rel} ... FAILED: {error}")
+    finally:
+        if use_word:
+            word.Quit()
+            comtypes.CoUninitialize()
+
+    print(f"\nTotal: {total} | Converted: {converted} | Skipped: {skipped} | Failed: {failed}")
+
+
+# ---------------------------------------------------------------------------
+# GUI mode (tkinter)
+# ---------------------------------------------------------------------------
+
+def main_gui():
+    """Launch the tkinter GUI."""
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+
+    class ConverterApp(tk.Tk):
+        def __init__(self):
+            super().__init__()
+            self.title("DOCX to PDF Converter")
+            self.minsize(780, 520)
+            self._build_ui()
+            self._converting = False
+
+        # ---- UI construction -----------------------------------------------
+
+        def _build_ui(self):
+            pad = {"padx": 10, "pady": 5}
+
+            # -- Directory row -----------------------------------------------
+            dir_frame = ttk.Frame(self)
+            dir_frame.pack(fill="x", **pad)
+
+            ttk.Label(dir_frame, text="Directory:").pack(side="left")
+            self.dir_var = tk.StringVar()
+            self.dir_entry = ttk.Entry(dir_frame, textvariable=self.dir_var)
+            self.dir_entry.pack(side="left", fill="x", expand=True, padx=(5, 5))
+            ttk.Button(dir_frame, text="Browse", command=self._browse).pack(side="left")
+
+            # -- Convert button ----------------------------------------------
+            self.convert_btn = ttk.Button(self, text="Convert", command=self._start_conversion)
+            self.convert_btn.pack(**pad)
+
+            # -- Progress bar + counter --------------------------------------
+            prog_frame = ttk.Frame(self)
+            prog_frame.pack(fill="x", **pad)
+
+            ttk.Label(prog_frame, text="Progress:").pack(side="left")
+            self.progress = ttk.Progressbar(prog_frame, length=400, mode="determinate")
+            self.progress.pack(side="left", fill="x", expand=True, padx=(5, 5))
+            self.prog_label = ttk.Label(prog_frame, text="0 / 0")
+            self.prog_label.pack(side="left")
+
+            # -- Report table (Treeview) -------------------------------------
+            table_frame = ttk.LabelFrame(self, text="Conversion Report")
+            table_frame.pack(fill="both", expand=True, **pad)
+
+            columns = ("num", "file", "status", "pdf_path")
+            self.tree = ttk.Treeview(
+                table_frame, columns=columns, show="headings", selectmode="browse"
+            )
+            self.tree.heading("num", text="#")
+            self.tree.heading("file", text="File")
+            self.tree.heading("status", text="Status")
+            self.tree.heading("pdf_path", text="PDF Path")
+
+            self.tree.column("num", width=40, stretch=False, anchor="center")
+            self.tree.column("file", width=220, anchor="w")
+            self.tree.column("status", width=140, anchor="w")
+            self.tree.column("pdf_path", width=340, anchor="w")
+
+            scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+            self.tree.configure(yscrollcommand=scrollbar.set)
+            self.tree.pack(side="left", fill="both", expand=True)
+            scrollbar.pack(side="right", fill="y")
+
+            # -- Summary label -----------------------------------------------
+            self.summary_var = tk.StringVar(value="Total: 0 | Converted: 0 | Skipped: 0 | Failed: 0")
+            ttk.Label(self, textvariable=self.summary_var, font=("", 10, "bold")).pack(**pad)
+
+        # ---- Callbacks -----------------------------------------------------
+
+        def _browse(self):
+            folder = filedialog.askdirectory(title="Select folder with .docx files")
+            if folder:
+                self.dir_var.set(folder)
+
+        def _start_conversion(self):
+            if self._converting:
+                return
+
+            directory = self.dir_var.get().strip().strip('"').strip("'")
+            if not directory:
+                messagebox.showwarning("No directory", "Please select a directory first.")
+                return
+
+            root = Path(directory)
+            if not root.is_dir():
+                messagebox.showerror("Invalid directory", f"'{directory}' is not a valid directory.")
+                return
+
+            docx_files = find_docx_files(root)
+            if not docx_files:
+                messagebox.showinfo("Nothing to do", "No .docx files found in that directory.")
+                return
+
+            # Reset UI
+            self.tree.delete(*self.tree.get_children())
+            total = len(docx_files)
+            self.progress["maximum"] = total
+            self.progress["value"] = 0
+            self.prog_label.config(text=f"0 / {total}")
+            self.summary_var.set(f"Total: {total} | Converted: 0 | Skipped: 0 | Failed: 0")
+            self.convert_btn.state(["disabled"])
+            self._converting = True
+
+            thread = threading.Thread(
+                target=self._convert_thread, args=(root, docx_files), daemon=True
+            )
+            thread.start()
+
+        # ---- Background conversion thread ----------------------------------
+
+        def _convert_thread(self, root: Path, docx_files: list):
+            use_word = sys.platform == "win32"
+
+            word = None
+            if use_word:
+                import comtypes
+                import comtypes.client
+                comtypes.CoInitialize()
+                try:
+                    word = comtypes.client.CreateObject("Word.Application")
+                    word.Visible = False
+                except Exception as exc:
+                    comtypes.CoUninitialize()
+                    self.after(0, self._thread_error, f"Could not start Word:\n{exc}")
+                    return
+            else:
+                if shutil.which("soffice") is None:
+                    self.after(
+                        0, self._thread_error,
+                        "LibreOffice is not installed.\n\n"
+                        "Install it with:  sudo apt install libreoffice",
+                    )
+                    return
+
+            total = len(docx_files)
+            converted = 0
+            skipped = 0
+            failed = 0
+
+            try:
+                for idx, docx_file in enumerate(docx_files, start=1):
+                    abs_path = docx_file.resolve()
+                    pdf_path = abs_path.with_suffix(".pdf")
+
+                    if pdf_path.exists():
+                        skipped += 1
+                        status = "Skipped — PDF exists"
                         pdf_display = str(pdf_path)
                     else:
-                        failed += 1
-                        status = f"Failed — {error}"
-                        pdf_display = "—"
+                        if use_word:
+                            pdf_path, error = convert_one_word(abs_path, word)
+                        else:
+                            pdf_path, error = convert_one_libreoffice(abs_path)
 
-                # Compute path relative to the chosen root for display
-                try:
-                    rel = docx_file.relative_to(root)
-                except ValueError:
-                    rel = docx_file
+                        if error is None:
+                            converted += 1
+                            status = "Success"
+                            pdf_display = str(pdf_path)
+                        else:
+                            failed += 1
+                            status = f"Failed — {error}"
+                            pdf_display = "—"
 
-                # Schedule UI update on the main thread
-                self.after(
-                    0, self._update_row,
-                    idx, str(rel), status, pdf_display,
-                    idx, total, converted, skipped, failed,
-                )
-        finally:
-            if use_word:
-                word.Quit()
-                comtypes.CoUninitialize()
-            self.after(0, self._conversion_done)
+                    try:
+                        rel = docx_file.relative_to(root)
+                    except ValueError:
+                        rel = docx_file
 
-    # ---- Thread-safe UI updates --------------------------------------------
+                    self.after(
+                        0, self._update_row,
+                        idx, str(rel), status, pdf_display,
+                        idx, total, converted, skipped, failed,
+                    )
+            finally:
+                if use_word:
+                    word.Quit()
+                    comtypes.CoUninitialize()
+                self.after(0, self._conversion_done)
 
-    def _update_row(self, num, filename, status, pdf_path,
-                    current, total, converted, skipped, failed):
-        if status == "Success":
-            tag = "success"
-        elif status.startswith("Skipped"):
-            tag = "skipped"
-        else:
-            tag = "fail"
-        self.tree.insert("", "end", values=(num, filename, status, pdf_path), tags=(tag,))
-        self.tree.yview_moveto(1.0)  # auto-scroll to bottom
-        self.progress["value"] = current
-        self.prog_label.config(text=f"{current} / {total}")
-        self.summary_var.set(
-            f"Total: {total} | Converted: {converted} | Skipped: {skipped} | Failed: {failed}"
-        )
+        # ---- Thread-safe UI updates ----------------------------------------
 
-    def _conversion_done(self):
-        self._converting = False
-        self.convert_btn.state(["!disabled"])
+        def _update_row(self, num, filename, status, pdf_path,
+                        current, total, converted, skipped, failed):
+            if status == "Success":
+                tag = "success"
+            elif status.startswith("Skipped"):
+                tag = "skipped"
+            else:
+                tag = "fail"
+            self.tree.insert("", "end", values=(num, filename, status, pdf_path), tags=(tag,))
+            self.tree.yview_moveto(1.0)
+            self.progress["value"] = current
+            self.prog_label.config(text=f"{current} / {total}")
+            self.summary_var.set(
+                f"Total: {total} | Converted: {converted} | Skipped: {skipped} | Failed: {failed}"
+            )
 
-    def _thread_error(self, message):
-        self._converting = False
-        self.convert_btn.state(["!disabled"])
-        messagebox.showerror("Error", message)
+        def _conversion_done(self):
+            self._converting = False
+            self.convert_btn.state(["!disabled"])
+
+        def _thread_error(self, message):
+            self._converting = False
+            self.convert_btn.state(["!disabled"])
+            messagebox.showerror("Error", message)
+
+    app = ConverterApp()
+    app.tree.tag_configure("success", foreground="green")
+    app.tree.tag_configure("skipped", foreground="gray")
+    app.tree.tag_configure("fail", foreground="red")
+    app.mainloop()
 
 
 # ---------------------------------------------------------------------------
@@ -283,14 +396,12 @@ class ConverterApp(tk.Tk):
 # ---------------------------------------------------------------------------
 
 def main():
-    app = ConverterApp()
+    force_cli = "--cli" in sys.argv
 
-    # Colour-code rows
-    app.tree.tag_configure("success", foreground="green")
-    app.tree.tag_configure("skipped", foreground="gray")
-    app.tree.tag_configure("fail", foreground="red")
-
-    app.mainloop()
+    if force_cli or not _display_available():
+        main_cli()
+    else:
+        main_gui()
 
 
 if __name__ == "__main__":
