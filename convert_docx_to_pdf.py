@@ -2,16 +2,17 @@
 DOCX-to-PDF Converter — GUI Edition
 
 Browse to a folder (including mapped Google Drive letters), convert every
-.docx file to PDF using Microsoft Word COM automation, and view a live
-progress bar plus a detailed report table.
+.docx file to PDF, and view a live progress bar plus a detailed report table.
 
 Requirements:
-    - Windows with Microsoft Word installed
-    - pip install comtypes
     - Python 3.8+  (tkinter is included with the standard installer)
+    - Windows: Microsoft Word installed + pip install comtypes
+    - Linux/macOS: LibreOffice installed (sudo apt install libreoffice)
 """
 
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -30,14 +31,35 @@ def find_docx_files(root: Path):
     )
 
 
-def convert_one(docx_path: Path, word_app):
-    """Convert a single .docx → .pdf. Returns (pdf_path, error_string|None)."""
+def convert_one_word(docx_path: Path, word_app):
+    """Convert a single .docx → .pdf using Word COM. Returns (pdf_path, error|None)."""
     pdf_path = docx_path.with_suffix(".pdf")
     try:
         doc = word_app.Documents.Open(str(docx_path))
         doc.SaveAs(str(pdf_path), FileFormat=17)  # 17 = wdFormatPDF
         doc.Close()
         return pdf_path, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def convert_one_libreoffice(docx_path: Path):
+    """Convert a single .docx → .pdf using LibreOffice. Returns (pdf_path, error|None)."""
+    pdf_path = docx_path.with_suffix(".pdf")
+    try:
+        result = subprocess.run(
+            [
+                "soffice", "--headless", "--convert-to", "pdf",
+                "--outdir", str(docx_path.parent),
+                str(docx_path),
+            ],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            return None, result.stderr.strip() or f"soffice exited with code {result.returncode}"
+        if pdf_path.exists():
+            return pdf_path, None
+        return None, "PDF file was not created"
     except Exception as exc:
         return None, str(exc)
 
@@ -155,18 +177,31 @@ class ConverterApp(tk.Tk):
     # ---- Background conversion thread --------------------------------------
 
     def _convert_thread(self, root: Path, docx_files: list):
-        # COM must be initialised on the thread that uses it.
-        import comtypes
-        import comtypes.client
-        comtypes.CoInitialize()
+        use_word = sys.platform == "win32"
 
-        try:
-            word = comtypes.client.CreateObject("Word.Application")
-            word.Visible = False
-        except Exception as exc:
-            self.after(0, self._thread_error, f"Could not start Word:\n{exc}")
-            return
+        # --- Platform-specific setup ----------------------------------------
+        word = None
+        if use_word:
+            import comtypes
+            import comtypes.client
+            comtypes.CoInitialize()
+            try:
+                word = comtypes.client.CreateObject("Word.Application")
+                word.Visible = False
+            except Exception as exc:
+                comtypes.CoUninitialize()
+                self.after(0, self._thread_error, f"Could not start Word:\n{exc}")
+                return
+        else:
+            if shutil.which("soffice") is None:
+                self.after(
+                    0, self._thread_error,
+                    "LibreOffice is not installed.\n\n"
+                    "Install it with:  sudo apt install libreoffice",
+                )
+                return
 
+        # --- Convert each file ----------------------------------------------
         total = len(docx_files)
         converted = 0
         skipped = 0
@@ -183,7 +218,10 @@ class ConverterApp(tk.Tk):
                     status = "Skipped — PDF exists"
                     pdf_display = str(pdf_path)
                 else:
-                    pdf_path, error = convert_one(abs_path, word)
+                    if use_word:
+                        pdf_path, error = convert_one_word(abs_path, word)
+                    else:
+                        pdf_path, error = convert_one_libreoffice(abs_path)
 
                     if error is None:
                         converted += 1
@@ -207,8 +245,9 @@ class ConverterApp(tk.Tk):
                     idx, total, converted, skipped, failed,
                 )
         finally:
-            word.Quit()
-            comtypes.CoUninitialize()
+            if use_word:
+                word.Quit()
+                comtypes.CoUninitialize()
             self.after(0, self._conversion_done)
 
     # ---- Thread-safe UI updates --------------------------------------------
