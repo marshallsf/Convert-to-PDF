@@ -107,7 +107,7 @@ class ConverterApp(tk.Tk):
         scrollbar.pack(side="right", fill="y")
 
         # -- Summary label ---------------------------------------------------
-        self.summary_var = tk.StringVar(value="Total: 0 | Converted: 0 | Failed: 0")
+        self.summary_var = tk.StringVar(value="Total: 0 | Converted: 0 | Skipped: 0 | Failed: 0")
         ttk.Label(self, textvariable=self.summary_var, font=("", 10, "bold")).pack(**pad)
 
     # ---- Callbacks ---------------------------------------------------------
@@ -142,7 +142,7 @@ class ConverterApp(tk.Tk):
         self.progress["maximum"] = total
         self.progress["value"] = 0
         self.prog_label.config(text=f"0 / {total}")
-        self.summary_var.set(f"Total: {total} | Converted: 0 | Failed: 0")
+        self.summary_var.set(f"Total: {total} | Converted: 0 | Skipped: 0 | Failed: 0")
         self.convert_btn.state(["disabled"])
         self._converting = True
 
@@ -169,21 +169,30 @@ class ConverterApp(tk.Tk):
 
         total = len(docx_files)
         converted = 0
+        skipped = 0
         failed = 0
 
         try:
             for idx, docx_file in enumerate(docx_files, start=1):
                 abs_path = docx_file.resolve()
-                pdf_path, error = convert_one(abs_path, word)
+                pdf_path = abs_path.with_suffix(".pdf")
 
-                if error is None:
-                    converted += 1
-                    status = "Success"
+                # Skip if a PDF already exists
+                if pdf_path.exists():
+                    skipped += 1
+                    status = "Skipped — PDF exists"
                     pdf_display = str(pdf_path)
                 else:
-                    failed += 1
-                    status = f"Failed — {error}"
-                    pdf_display = "—"
+                    pdf_path, error = convert_one(abs_path, word)
+
+                    if error is None:
+                        converted += 1
+                        status = "Success"
+                        pdf_display = str(pdf_path)
+                    else:
+                        failed += 1
+                        status = f"Failed — {error}"
+                        pdf_display = "—"
 
                 # Compute path relative to the chosen root for display
                 try:
@@ -195,7 +204,7 @@ class ConverterApp(tk.Tk):
                 self.after(
                     0, self._update_row,
                     idx, str(rel), status, pdf_display,
-                    idx, total, converted, failed,
+                    idx, total, converted, skipped, failed,
                 )
         finally:
             word.Quit()
@@ -205,14 +214,19 @@ class ConverterApp(tk.Tk):
     # ---- Thread-safe UI updates --------------------------------------------
 
     def _update_row(self, num, filename, status, pdf_path,
-                    current, total, converted, failed):
-        tag = "success" if status == "Success" else "fail"
+                    current, total, converted, skipped, failed):
+        if status == "Success":
+            tag = "success"
+        elif status.startswith("Skipped"):
+            tag = "skipped"
+        else:
+            tag = "fail"
         self.tree.insert("", "end", values=(num, filename, status, pdf_path), tags=(tag,))
         self.tree.yview_moveto(1.0)  # auto-scroll to bottom
         self.progress["value"] = current
         self.prog_label.config(text=f"{current} / {total}")
         self.summary_var.set(
-            f"Total: {total} | Converted: {converted} | Failed: {failed}"
+            f"Total: {total} | Converted: {converted} | Skipped: {skipped} | Failed: {failed}"
         )
 
     def _conversion_done(self):
@@ -234,6 +248,7 @@ def main():
 
     # Colour-code rows
     app.tree.tag_configure("success", foreground="green")
+    app.tree.tag_configure("skipped", foreground="gray")
     app.tree.tag_configure("fail", foreground="red")
 
     app.mainloop()
